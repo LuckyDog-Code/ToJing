@@ -57,44 +57,25 @@
     musicBtn.classList.remove("nudge");
   }
 
-  // iOS / 微信只允许在点击时开始有声播放，滑动不算。所以在「轻触开启」的点击里就真正开始播放，
-  // 但声音经过音量为 0 的 GainNode（iOS 忽略 audio.volume，但认 GainNode），信封打开时再淡入。
-  const AC = window.AudioContext || window.webkitAudioContext;
-  let actx, gain;
+  // iOS / 微信只允许在点击时开始播放，滑动不算。所以在「轻触开启」的点击里就静音开始播放，
+  // 信封打开时取消静音（已经在播放的音频取消静音不需要再点击）。
+  // 不用 Web Audio 处理音乐：iOS 上它会和麦克风抢音频会话，导致吹蜡烛读不到声音。
   function unlockAudio() {
-    // 让 Web Audio 不受 iPhone 静音键影响（Safari 16.4+）
-    try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
-    if (AC && !actx) {
-      try {
-        actx = new AC();
-        gain = actx.createGain();
-        gain.gain.value = 0;
-        actx.createMediaElementSource(audio).connect(gain).connect(actx.destination);
-      } catch (e) { actx = gain = null; }
-    }
-    if (actx) actx.resume();
+    audio.muted = true;
     audio.play().catch(() => {});
-  }
-
-  function fadeIn() {
-    if (gain) {
-      const t = actx.currentTime;
-      gain.gain.cancelScheduledValues(t);
-      gain.gain.setValueAtTime(0, t);
-      gain.gain.linearRampToValueAtTime(TARGET_VOL, t + 4);
-    } else {
-      audio.volume = 0;
-      gsap.to(audio, { volume: TARGET_VOL, duration: 4, ease: "sine.inOut" });
-    }
   }
 
   function startMusic() {
     if (musicStarted) return;
     musicStarted = true;
-    if (actx) actx.resume();
     audio.currentTime = 0; // 点开启后一直在静音播放，从头开始
+    audio.volume = 0; // iOS 忽略 volume，会直接以系统音量播放
+    audio.muted = false;
     const p = audio.paused ? audio.play() : Promise.resolve();
-    p.then(() => { setPlayingUI(true); fadeIn(); }).catch(() => {
+    p.then(() => {
+      setPlayingUI(true);
+      gsap.to(audio, { volume: TARGET_VOL, duration: 4, ease: "sine.inOut" });
+    }).catch(() => {
       // 浏览器仍然拦截：让音乐按钮跳动提示，下一次点击时重试（iOS 上只有 click 算用户操作）
       musicStarted = false;
       musicBtn.classList.add("nudge");
@@ -105,17 +86,12 @@
   musicBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     if (!musicStarted) return startMusic();
-    if (audio.paused) { if (actx) actx.resume(); audio.play(); setPlayingUI(true); }
+    if (audio.paused) { audio.play(); setPlayingUI(true); }
     else { audio.pause(); setPlayingUI(false); }
   });
 
-  // 切到后台再回来时 iOS 会挂起 AudioContext
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && actx && !audio.paused) actx.resume();
-  });
-
   // 微信内置浏览器：在 JSBridge 就绪时预加载
-  document.addEventListener("WeixinJSBridgeReady", () => audio.load(), false);
+  document.addEventListener("WeixinJSBridgeReady", () => { if (audio.paused) audio.load(); }, false);
 
   /* ---------------- 1. 开场 ---------------- */
   const intro = gsap.timeline({ delay: 0.3 });
@@ -260,10 +236,10 @@
   $("candles").addEventListener("click", blowOut);
 
   /* 对着麦克风吹气 */
+  const AC = window.AudioContext || window.webkitAudioContext;
   let micStream, micCtx, micRaf, micBusy = false;
-  const setSession = (type) => { try { if (navigator.audioSession) navigator.audioSession.type = type; } catch (e) {} };
   function closeMicCtx() {
-    if (micCtx && micCtx !== actx) micCtx.close();
+    if (micCtx) micCtx.close();
     micCtx = null;
   }
   function stopMic() {
@@ -274,12 +250,11 @@
     micBusy = false;
     $("mic-btn").classList.remove("listening");
     document.querySelectorAll(".flame").forEach((f) => { f.style.opacity = ""; });
-    setSession("playback");
-    if (actx) actx.resume(); // iOS 开麦时可能打断背景音乐
+    if (musicStarted && audio.paused) audio.play().catch(() => {}); // iOS 开麦时可能打断背景音乐
   }
 
   // iOS 上 AudioContext 必须在麦克风打开之后再建：开麦会改采样率，之前建的读到的全是 0。
-  // 仍然读不到声音时依次换下一种方式重建。
+  // 仍然读不到声音时换成按麦克风采样率重建。
   function buildAnalyser(way) {
     closeMicCtx();
     if (way === 0) micCtx = new AC();
@@ -287,8 +262,7 @@
       const sr = micStream.getAudioTracks()[0].getSettings().sampleRate;
       if (!sr) return null;
       micCtx = new AC({ sampleRate: sr });
-    } else if (way === 2 && actx) micCtx = actx;
-    else return null;
+    } else return null;
     micCtx.resume();
     const analyser = micCtx.createAnalyser();
     analyser.fftSize = 1024;
@@ -308,7 +282,6 @@
       return;
     }
     micBusy = true;
-    setSession("play-and-record"); // 音乐用的 "playback" 会话不允许录音
     try {
       // 关掉降噪、回声消除和自动增益，否则吹气声会被当成噪音滤掉
       micStream = await navigator.mediaDevices.getUserMedia({
@@ -352,7 +325,7 @@
       // 一秒多都是完全的 0：说明这种方式读不到麦克风，换下一种
       if (peak === 0 && now - wayStart > 1200) {
         let next = null;
-        while (!next && way < 2) next = buildAnalyser(++way);
+        while (!next && way < 1) next = buildAnalyser(++way);
         if (next) { analyser = next; bufs(); wayStart = t0 = now; noise = noiseN = 0; }
         else wayStart = Infinity;
       }
