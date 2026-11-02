@@ -268,6 +268,7 @@
     if (micCtx) micCtx.close();
     micStream = micCtx = null;
     $("mic-btn").classList.remove("listening");
+    document.querySelectorAll(".flame").forEach((f) => { f.style.opacity = ""; });
     setSession("playback");
     if (actx) actx.resume(); // iOS 开麦时可能打断背景音乐
   }
@@ -300,20 +301,45 @@
     btn.classList.add("listening");
     btn.textContent = "在听哦，对着手机用力吹～";
     const analyser = micCtx.createAnalyser();
-    analyser.fftSize = 512;
-    micCtx.createMediaStreamSource(micStream).connect(analyser);
-    const buf = new Uint8Array(analyser.fftSize);
-    let loudFrames = 0;
-    const deadline = performance.now() + 20000;
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0;
+    const src = micCtx.createMediaStreamSource(micStream);
+    // Safari 不会处理没接到输出的节点，读到的全是 0；接一个音量为 0 的出口
+    const sink = micCtx.createGain();
+    sink.gain.value = 0;
+    src.connect(analyser).connect(sink).connect(micCtx.destination);
+
+    const fbuf = analyser.getFloatTimeDomainData ? new Float32Array(analyser.fftSize) : null;
+    const bbuf = new Uint8Array(analyser.fftSize);
+    function level() {
+      let sum = 0, n = analyser.fftSize;
+      if (fbuf) { analyser.getFloatTimeDomainData(fbuf); for (let i = 0; i < n; i++) sum += fbuf[i] * fbuf[i]; }
+      else { analyser.getByteTimeDomainData(bbuf); for (let i = 0; i < n; i++) { const v = (bbuf[i] - 128) / 128; sum += v * v; } }
+      return Math.sqrt(sum / n);
+    }
+
+    // 不同手机的麦克风灵敏度差很多，先听半秒环境音，再按「比环境响很多」来判断吹气
+    const debug = /debug/.test(location.search);
+    const flames = document.querySelectorAll(".flame");
+    const t0 = performance.now();
+    const deadline = t0 + 25000;
+    let noise = 0, noiseN = 0, loud = 0, peak = 0;
 
     (function listen() {
-      analyser.getByteTimeDomainData(buf);
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
-      const rms = Math.sqrt(sum / buf.length);
-      loudFrames = rms > 0.12 ? loudFrames + 1 : Math.max(0, loudFrames - 1);
-      if (loudFrames > 8) return blowOut();
-      if (performance.now() > deadline) { stopMic(); btn.textContent = C.micButton; return; }
+      const rms = level();
+      const now = performance.now();
+      if (now - t0 < 500) { noise += rms; noiseN++; }
+      else {
+        const base = noise / Math.max(1, noiseN);
+        const thr = Math.min(0.08, Math.max(0.02, base * 4));
+        const k = Math.min(1, rms / thr);
+        flames.forEach((f) => { f.style.opacity = String(1 - 0.6 * k); }); // 火苗随气息变弱，让她知道在起作用
+        loud = rms > thr ? loud + 1 : Math.max(0, loud - 1);
+        peak = Math.max(peak, rms);
+        if (debug) btn.textContent = `环境 ${base.toFixed(3)} 当前 ${rms.toFixed(3)} 门槛 ${thr.toFixed(3)} 最高 ${peak.toFixed(3)}`;
+        if (loud > 6) return blowOut();
+      }
+      if (now > deadline) { stopMic(); btn.textContent = C.micButton; return; }
       micRaf = requestAnimationFrame(listen);
     })();
   });
