@@ -85,8 +85,12 @@
 
   musicBtn.addEventListener("click", (e) => {
     e.stopPropagation();
+    // 开麦时点音乐按钮会退出收音，接着播放。
+    if (micBusy) { stopMic(); return; }
+    clearTimeout(musicResumeTimer);
+    musicPausedForMic = false;
     if (!musicStarted) return startMusic();
-    if (audio.paused) { audio.play(); setPlayingUI(true); }
+    if (audio.paused) { resumeMusic(); }
     else { audio.pause(); setPlayingUI(false); }
   });
 
@@ -238,36 +242,51 @@
   /* 对着麦克风吹气 */
   const AC = window.AudioContext || window.webkitAudioContext;
   let micStream, micCtx, micRaf, micBusy = false, musicPausedForMic = false;
-  function closeMicCtx() {
-    if (micCtx) micCtx.close();
-    micCtx = null;
+  let micSession = 0, musicResumeTimer;
+  function resumeMusic() {
+    return audio.play().then(() => {
+      setPlayingUI(true);
+    }).catch(() => {
+      setPlayingUI(false);
+      musicBtn.classList.add("nudge");
+    });
   }
-  function stopMic() {
+  function closeMicCtx() {
+    const ctx = micCtx;
+    micCtx = null;
+    return ctx && ctx.state !== "closed" ? ctx.close().catch(() => {}) : Promise.resolve();
+  }
+  function stopMic(message = C.micButton) {
+    const session = ++micSession;
     cancelAnimationFrame(micRaf);
     if (micStream) micStream.getTracks().forEach((t) => t.stop());
     micStream = null;
-    closeMicCtx();
+    const closing = closeMicCtx();
     micBusy = false;
     $("mic-btn").classList.remove("listening");
+    $("mic-btn").textContent = message;
     document.querySelectorAll(".flame").forEach((f) => { f.style.opacity = ""; });
     // 等系统把音频切回播放模式再继续放歌，否则 iOS 会从听筒小声放、断断续续
     if (musicPausedForMic) {
-      musicPausedForMic = false;
-      setTimeout(() => { audio.play().then(() => setPlayingUI(true)).catch(() => musicBtn.classList.add("nudge")); }, 600);
+      musicResumeTimer = setTimeout(async () => {
+        await closing;
+        if (session === micSession && !micBusy) {
+          musicPausedForMic = false;
+          resumeMusic();
+        }
+      }, 600);
     }
   }
 
-  // iOS 上 AudioContext 必须在麦克风打开之后再建：开麦会改采样率，之前建的读到的全是 0。
-  // 仍然读不到声音时换成按麦克风采样率重建。
+  // 首次上下文在点击手势内解锁；采样率切换导致全零时再重建。
   function buildAnalyser(way) {
-    closeMicCtx();
-    if (way === 0) micCtx = new AC();
-    else if (way === 1) {
-      const sr = micStream.getAudioTracks()[0].getSettings().sampleRate;
-      if (!sr) return null;
-      micCtx = new AC({ sampleRate: sr });
-    } else return null;
-    micCtx.resume();
+    if (way === 1) {
+      closeMicCtx();
+      const track = micStream.getAudioTracks()[0];
+      const sr = track.getSettings ? track.getSettings().sampleRate : null;
+      micCtx = sr ? new AC({ sampleRate: sr }) : new AC();
+    }
+    micCtx.resume().catch(() => {});
     const analyser = micCtx.createAnalyser();
     analyser.fftSize = 1024;
     analyser.smoothingTimeConstant = 0;
@@ -280,28 +299,54 @@
 
   $("mic-btn").addEventListener("click", async () => {
     const btn = $("mic-btn");
-    if (micBusy) { if (micCtx) micCtx.resume(); return; } // 再点一下可以唤醒被挂起的音频
+    if (blown) return;
+    if (micBusy) {
+      if (micCtx && micCtx.state !== "running") {
+        micCtx.resume().catch(() => stopMic("收音没有启动，点一下蜡烛也能许愿哦"));
+      } else stopMic();
+      return;
+    }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !AC) {
       btn.textContent = "这里用不了麦克风，点一下蜡烛就好啦";
       return;
     }
+    clearTimeout(musicResumeTimer);
+    const session = ++micSession;
     micBusy = true;
+    btn.textContent = "正在开启麦克风，再点可取消";
     // iOS 开麦时会把正在放的歌切到听筒，麦克风也会被干扰；先暂停，吹完再接着放
     if (!audio.paused) { audio.pause(); setPlayingUI(false); musicPausedForMic = true; }
     try {
+      micCtx = new AC();
+      micCtx.resume().catch(() => {});
       // 关掉降噪、回声消除和自动增益，否则吹气声会被当成噪音滤掉
-      micStream = await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
       });
+      // 等待授权期间，用户可能已经点蜡烛或退出，不能重新占用麦克风。
+      if (session !== micSession || blown) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      micStream = stream;
+      const track = stream.getAudioTracks()[0];
+      if (!track || track.readyState === "ended") throw new Error("麦克风未启动");
+      track.addEventListener("ended", () => {
+        if (session === micSession) stopMic("收音中断了，可以重试或点一下蜡烛");
+      });
+      startListening(session);
     } catch (err) {
-      stopMic();
-      btn.textContent = err && err.name === "NotAllowedError"
+      if (session !== micSession) return;
+      stopMic(err && err.name === "NotAllowedError"
         ? "没有拿到麦克风权限，点一下蜡烛就好啦"
-        : "麦克风用不了，点一下蜡烛就好啦";
-      return;
+        : "麦克风用不了，点一下蜡烛就好啦");
     }
+  });
+
+  function startListening(session) {
+    const btn = $("mic-btn");
     btn.classList.add("listening");
-    btn.textContent = "在听哦，对着手机用力吹～";
+    btn.textContent = "音乐暂歇，先安静半秒，再对着手机底部吹气～（再点退出）";
 
     let way = 0, analyser = buildAnalyser(way);
     let fbuf, bbuf;
@@ -320,43 +365,55 @@
     // 不同手机的麦克风灵敏度差很多，先听半秒环境音，再按「比环境响很多」来判断吹气
     const debug = /debug/.test(location.search);
     const flames = document.querySelectorAll(".flame");
-    let t0 = performance.now(), wayStart = t0;
+    let t0 = performance.now(), wayStart = t0, last = t0;
     const deadline = t0 + 30000;
-    let noise = 0, noiseN = 0, loud = 0, peak = 0;
+    let noise = Infinity, loud = 0, peak = 0;
 
     (function listen() {
+      if (session !== micSession || !micBusy || blown) return;
       const now = performance.now();
+      const dt = Math.min(50, now - last);
+      last = now;
       // Safari 可能让授权后才建的 AudioContext 处于挂起状态，读数全是 0；提示她再点一下
       if (micCtx.state !== "running") {
         btn.textContent = "再点我一下，然后对着手机吹～";
-        wayStart = t0 = now; noise = noiseN = 0;
-        if (now > deadline) { stopMic(); btn.textContent = C.micButton; return; }
+        wayStart = t0 = now; noise = Infinity; loud = 0;
+        if (now > deadline) { stopMic("收音没有启动，点一下蜡烛也能许愿哦"); return; }
         micRaf = requestAnimationFrame(listen);
         return;
       }
-      if (btn.textContent.startsWith("再点我")) btn.textContent = "在听哦，对着手机用力吹～";
+      if (btn.textContent.startsWith("再点我")) btn.textContent = "先安静半秒，再对着手机底部吹气～（再点退出）";
       const rms = level();
       peak = Math.max(peak, rms);
       // 一秒多都是完全的 0：说明这种方式读不到麦克风，换下一种
       if (peak === 0 && now - wayStart > 1200) {
         let next = null;
-        while (!next && way < 1) next = buildAnalyser(++way);
-        if (next) { analyser = next; bufs(); wayStart = t0 = now; noise = noiseN = 0; }
-        else wayStart = Infinity;
+        try {
+          while (!next && way < 1) next = buildAnalyser(++way);
+        } catch (err) {
+          stopMic("收音没有启动，可以重试或点一下蜡烛");
+          return;
+        }
+        if (next) { analyser = next; bufs(); wayStart = t0 = now; noise = Infinity; loud = 0; }
+        else { stopMic("没有收到声音，可以重试或点一下蜡烛"); return; }
       }
-      if (now - t0 < 500) { noise += rms; noiseN++; }
+      if (now - t0 < 500) { noise = Math.min(noise, rms); }
       else {
-        const base = noise / Math.max(1, noiseN);
-        const thr = Math.min(0.08, Math.max(0.02, base * 4));
+        const base = Number.isFinite(noise) ? noise : 0;
+        const thr = Math.max(0.008, Math.min(0.04, base * 2.5 + 0.004));
         const k = Math.min(1, rms / thr);
         flames.forEach((f) => { f.style.opacity = String(1 - 0.6 * k); }); // 火苗随气息变弱，让她知道在起作用
-        loud = rms > thr ? loud + 1 : Math.max(0, loud - 1);
+        loud = rms > thr ? loud + dt : Math.max(0, loud - dt * 0.5);
         if (debug) btn.textContent = `方式${way} ${micCtx ? micCtx.state + " " + micCtx.sampleRate : ""} 环境${base.toFixed(3)} 当前${rms.toFixed(3)} 门槛${thr.toFixed(3)} 最高${peak.toFixed(3)}`;
-        if (loud > 6) return blowOut();
+        if (loud >= 120) return blowOut();
       }
-      if (now > deadline) { stopMic(); btn.textContent = C.micButton; return; }
+      if (now > deadline) { stopMic("没吹灭也没关系，再试一次或点一下蜡烛吧"); return; }
       micRaf = requestAnimationFrame(listen);
     })();
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && micBusy) stopMic();
   });
 
   // 标题保持一行：按实际宽度缩小字号（不同字体/后备字体宽度不同）
