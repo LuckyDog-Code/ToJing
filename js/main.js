@@ -261,27 +261,44 @@
 
   /* 对着麦克风吹气 */
   let micStream, micCtx, micRaf;
+  const setSession = (type) => { try { if (navigator.audioSession) navigator.audioSession.type = type; } catch (e) {} };
   function stopMic() {
     cancelAnimationFrame(micRaf);
     if (micStream) micStream.getTracks().forEach((t) => t.stop());
     if (micCtx) micCtx.close();
     micStream = micCtx = null;
     $("mic-btn").classList.remove("listening");
+    setSession("playback");
+    if (actx) actx.resume(); // iOS 开麦时可能打断背景音乐
   }
 
   $("mic-btn").addEventListener("click", async () => {
     const btn = $("mic-btn");
-    if (micStream) return;
-    try {
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch (err) {
-      btn.textContent = "麦克风用不了，点一下蜡烛就好啦";
+    if (micStream || micCtx) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !AC) {
+      btn.textContent = "这里用不了麦克风，点一下蜡烛就好啦";
       return;
     }
+    // AudioContext 要在点击时同步创建，等授权回来再建 iOS 会让它处于挂起状态，只能读到静音
+    micCtx = new AC();
+    micCtx.resume();
+    // 音乐用的 "playback" 会话不允许录音，开麦前切换
+    setSession("play-and-record");
+    try {
+      // 关掉降噪、回声消除和自动增益，否则吹气声会被当成噪音滤掉
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      });
+    } catch (err) {
+      stopMic();
+      btn.textContent = err && err.name === "NotAllowedError"
+        ? "没有拿到麦克风权限，点一下蜡烛就好啦"
+        : "麦克风用不了，点一下蜡烛就好啦";
+      return;
+    }
+    await micCtx.resume();
     btn.classList.add("listening");
     btn.textContent = "在听哦，对着手机用力吹～";
-    const AC = window.AudioContext || window.webkitAudioContext;
-    micCtx = new AC();
     const analyser = micCtx.createAnalyser();
     analyser.fftSize = 512;
     micCtx.createMediaStreamSource(micStream).connect(analyser);
@@ -294,7 +311,7 @@
       let sum = 0;
       for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
       const rms = Math.sqrt(sum / buf.length);
-      loudFrames = rms > 0.16 ? loudFrames + 1 : Math.max(0, loudFrames - 1);
+      loudFrames = rms > 0.12 ? loudFrames + 1 : Math.max(0, loudFrames - 1);
       if (loudFrames > 8) return blowOut();
       if (performance.now() > deadline) { stopMic(); btn.textContent = C.micButton; return; }
       micRaf = requestAnimationFrame(listen);
