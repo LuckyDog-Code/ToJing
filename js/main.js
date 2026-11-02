@@ -260,31 +260,55 @@
   $("candles").addEventListener("click", blowOut);
 
   /* 对着麦克风吹气 */
-  let micStream, micCtx, micRaf;
+  let micStream, micCtx, micRaf, micBusy = false;
   const setSession = (type) => { try { if (navigator.audioSession) navigator.audioSession.type = type; } catch (e) {} };
+  function closeMicCtx() {
+    if (micCtx && micCtx !== actx) micCtx.close();
+    micCtx = null;
+  }
   function stopMic() {
     cancelAnimationFrame(micRaf);
     if (micStream) micStream.getTracks().forEach((t) => t.stop());
-    if (micCtx) micCtx.close();
-    micStream = micCtx = null;
+    micStream = null;
+    closeMicCtx();
+    micBusy = false;
     $("mic-btn").classList.remove("listening");
     document.querySelectorAll(".flame").forEach((f) => { f.style.opacity = ""; });
     setSession("playback");
     if (actx) actx.resume(); // iOS 开麦时可能打断背景音乐
   }
 
+  // iOS 上 AudioContext 必须在麦克风打开之后再建：开麦会改采样率，之前建的读到的全是 0。
+  // 仍然读不到声音时依次换下一种方式重建。
+  function buildAnalyser(way) {
+    closeMicCtx();
+    if (way === 0) micCtx = new AC();
+    else if (way === 1) {
+      const sr = micStream.getAudioTracks()[0].getSettings().sampleRate;
+      if (!sr) return null;
+      micCtx = new AC({ sampleRate: sr });
+    } else if (way === 2 && actx) micCtx = actx;
+    else return null;
+    micCtx.resume();
+    const analyser = micCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0;
+    // Safari 不会处理没接到输出的节点；接一个音量为 0 的出口
+    const sink = micCtx.createGain();
+    sink.gain.value = 0;
+    micCtx.createMediaStreamSource(micStream).connect(analyser).connect(sink).connect(micCtx.destination);
+    return analyser;
+  }
+
   $("mic-btn").addEventListener("click", async () => {
     const btn = $("mic-btn");
-    if (micStream || micCtx) return;
+    if (micBusy) return;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !AC) {
       btn.textContent = "这里用不了麦克风，点一下蜡烛就好啦";
       return;
     }
-    // AudioContext 要在点击时同步创建，等授权回来再建 iOS 会让它处于挂起状态，只能读到静音
-    micCtx = new AC();
-    micCtx.resume();
-    // 音乐用的 "playback" 会话不允许录音，开麦前切换
-    setSession("play-and-record");
+    micBusy = true;
+    setSession("play-and-record"); // 音乐用的 "playback" 会话不允许录音
     try {
       // 关掉降噪、回声消除和自动增益，否则吹气声会被当成噪音滤掉
       micStream = await navigator.mediaDevices.getUserMedia({
@@ -297,20 +321,16 @@
         : "麦克风用不了，点一下蜡烛就好啦";
       return;
     }
-    await micCtx.resume();
     btn.classList.add("listening");
     btn.textContent = "在听哦，对着手机用力吹～";
-    const analyser = micCtx.createAnalyser();
-    analyser.fftSize = 1024;
-    analyser.smoothingTimeConstant = 0;
-    const src = micCtx.createMediaStreamSource(micStream);
-    // Safari 不会处理没接到输出的节点，读到的全是 0；接一个音量为 0 的出口
-    const sink = micCtx.createGain();
-    sink.gain.value = 0;
-    src.connect(analyser).connect(sink).connect(micCtx.destination);
 
-    const fbuf = analyser.getFloatTimeDomainData ? new Float32Array(analyser.fftSize) : null;
-    const bbuf = new Uint8Array(analyser.fftSize);
+    let way = 0, analyser = buildAnalyser(way);
+    let fbuf, bbuf;
+    const bufs = () => {
+      fbuf = analyser.getFloatTimeDomainData ? new Float32Array(analyser.fftSize) : null;
+      bbuf = new Uint8Array(analyser.fftSize);
+    };
+    bufs();
     function level() {
       let sum = 0, n = analyser.fftSize;
       if (fbuf) { analyser.getFloatTimeDomainData(fbuf); for (let i = 0; i < n; i++) sum += fbuf[i] * fbuf[i]; }
@@ -321,13 +341,21 @@
     // 不同手机的麦克风灵敏度差很多，先听半秒环境音，再按「比环境响很多」来判断吹气
     const debug = /debug/.test(location.search);
     const flames = document.querySelectorAll(".flame");
-    const t0 = performance.now();
-    const deadline = t0 + 25000;
+    let t0 = performance.now(), wayStart = t0;
+    const deadline = t0 + 30000;
     let noise = 0, noiseN = 0, loud = 0, peak = 0;
 
     (function listen() {
       const rms = level();
       const now = performance.now();
+      peak = Math.max(peak, rms);
+      // 一秒多都是完全的 0：说明这种方式读不到麦克风，换下一种
+      if (peak === 0 && now - wayStart > 1200) {
+        let next = null;
+        while (!next && way < 2) next = buildAnalyser(++way);
+        if (next) { analyser = next; bufs(); wayStart = t0 = now; noise = noiseN = 0; }
+        else wayStart = Infinity;
+      }
       if (now - t0 < 500) { noise += rms; noiseN++; }
       else {
         const base = noise / Math.max(1, noiseN);
@@ -335,8 +363,7 @@
         const k = Math.min(1, rms / thr);
         flames.forEach((f) => { f.style.opacity = String(1 - 0.6 * k); }); // 火苗随气息变弱，让她知道在起作用
         loud = rms > thr ? loud + 1 : Math.max(0, loud - 1);
-        peak = Math.max(peak, rms);
-        if (debug) btn.textContent = `环境 ${base.toFixed(3)} 当前 ${rms.toFixed(3)} 门槛 ${thr.toFixed(3)} 最高 ${peak.toFixed(3)}`;
+        if (debug) btn.textContent = `方式${way} ${micCtx ? micCtx.state + " " + micCtx.sampleRate : ""} 环境${base.toFixed(3)} 当前${rms.toFixed(3)} 门槛${thr.toFixed(3)} 最高${peak.toFixed(3)}`;
         if (loud > 6) return blowOut();
       }
       if (now > deadline) { stopMic(); btn.textContent = C.micButton; return; }
