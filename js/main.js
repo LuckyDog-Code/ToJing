@@ -65,35 +65,22 @@
     audio.play().catch(() => {});
   }
 
-  async function startMusic() {
+  function startMusic() {
     if (musicStarted) return;
     musicStarted = true;
-    let seekTimer, onSeeked;
-    try {
-      // 跳转完成前保持静音，避免播出旧缓冲区的一截声音。
-      audio.muted = true;
-      audio.volume = 0; // iOS 忽略 volume，以系统音量播放
-      const seekReady = new Promise((resolve, reject) => {
-        onSeeked = resolve;
-        audio.addEventListener("seeked", onSeeked, { once: true });
-        audio.currentTime = 0;
-        if (!audio.seeking) resolve();
-        else seekTimer = setTimeout(() => reject(new Error("音乐定位超时")), 3000);
-      });
-      // 在当前操作中请求播放，兼顾手机浏览器的播放权限。
-      await Promise.all([seekReady, audio.play()]);
-      audio.muted = false;
+    audio.currentTime = 0; // 点开启后一直在静音播放，从头开始
+    audio.volume = 0; // iOS 忽略 volume，会直接以系统音量播放
+    audio.muted = false;
+    const p = audio.paused ? audio.play() : Promise.resolve();
+    p.then(() => {
       setPlayingUI(true);
       gsap.to(audio, { volume: TARGET_VOL, duration: 4, ease: "sine.inOut" });
-    } catch (err) {
+    }).catch(() => {
       // 浏览器仍然拦截：让音乐按钮跳动提示，下一次点击时重试（iOS 上只有 click 算用户操作）
       musicStarted = false;
       musicBtn.classList.add("nudge");
       addEventListener("click", startMusic, { once: true });
-    } finally {
-      clearTimeout(seekTimer);
-      if (onSeeked) audio.removeEventListener("seeked", onSeeked);
-    }
+    });
   }
 
   musicBtn.addEventListener("click", (e) => {

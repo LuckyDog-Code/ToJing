@@ -256,15 +256,12 @@ button { font: inherit; color: inherit; border: 0; background: none; cursor: poi
   text-align: center; position: relative;
 }
 .cake-wrap { display: flex; flex-direction: column; align-items: center; }
-.cake-display {
-  position: relative; width: min(76vw, 320px); margin-top: 70px;
-}
-.cake { width: 100%; display: block; }
+.cake { width: min(76vw, 320px); display: block; margin-top: -4px; }
 .candles {
-  display: flex; justify-content: space-evenly;
-  position: absolute; left: 24%; width: 52%; bottom: 75%; z-index: 1;
+  display: flex; gap: min(9vw, 38px);
+  margin-bottom: -2px; position: relative; z-index: 1;
   cursor: pointer;
-  padding-top: 30px; /* 扩大点击区域，底端对齐 SVG 中 y=55 的奶油表面 */
+  padding: 30px 20px 0; /* 扩大点击区域 */
 }
 .candle {
   width: 12px; height: 56px; position: relative; border-radius: 3px;
@@ -273,12 +270,6 @@ button { font: inherit; color: inherit; border: 0; background: none; cursor: poi
 .candle::before { /* 烛芯 */
   content: ""; position: absolute; left: 50%; top: -7px; width: 2px; height: 8px;
   background: #3b2a20; transform: translateX(-50%);
-}
-.candle::after { /* 插入奶油处的接触阴影 */
-  content: ""; position: absolute; bottom: -2px; left: -3px;
-  width: 18px; height: 5px; border-radius: 50%;
-  background: rgba(138, 59, 76, .22);
-  box-shadow: 0 1px 0 rgba(255, 246, 251, .85);
 }
 .flame {
   position: absolute; left: 50%; bottom: calc(100% + 4px);
