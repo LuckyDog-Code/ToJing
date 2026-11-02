@@ -57,37 +57,61 @@
     musicBtn.classList.remove("nudge");
   }
 
-  // 在「轻触开启」的点击里调用：静音播放一下再暂停，之后脚本就能自己播放了（iOS / 微信需要）
+  // iOS / 微信只允许在点击时开始有声播放，滑动不算。所以在「轻触开启」的点击里就真正开始播放，
+  // 但声音经过音量为 0 的 GainNode（iOS 忽略 audio.volume，但认 GainNode），信封打开时再淡入。
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let actx, gain;
   function unlockAudio() {
-    audio.muted = true;
-    const p = audio.play();
-    if (p) p.then(() => { audio.pause(); audio.currentTime = 0; audio.muted = false; })
-            .catch(() => { audio.muted = false; });
-    else { audio.pause(); audio.muted = false; }
+    // 让 Web Audio 不受 iPhone 静音键影响（Safari 16.4+）
+    try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
+    if (AC && !actx) {
+      try {
+        actx = new AC();
+        gain = actx.createGain();
+        gain.gain.value = 0;
+        actx.createMediaElementSource(audio).connect(gain).connect(actx.destination);
+      } catch (e) { actx = gain = null; }
+    }
+    if (actx) actx.resume();
+    audio.play().catch(() => {});
+  }
+
+  function fadeIn() {
+    if (gain) {
+      const t = actx.currentTime;
+      gain.gain.cancelScheduledValues(t);
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(TARGET_VOL, t + 4);
+    } else {
+      audio.volume = 0;
+      gsap.to(audio, { volume: TARGET_VOL, duration: 4, ease: "sine.inOut" });
+    }
   }
 
   function startMusic() {
     if (musicStarted) return;
     musicStarted = true;
-    audio.muted = false;
-    audio.volume = 0; // iOS 忽略 volume，会直接以系统音量播放
-    audio.play().then(() => {
-      setPlayingUI(true);
-      gsap.to(audio, { volume: TARGET_VOL, duration: 4, ease: "sine.inOut" });
-    }).catch(() => {
-      // 浏览器仍然拦截：让音乐按钮跳动提示，并在下一次触摸时重试
+    if (actx) actx.resume();
+    audio.currentTime = 0; // 点开启后一直在静音播放，从头开始
+    const p = audio.paused ? audio.play() : Promise.resolve();
+    p.then(() => { setPlayingUI(true); fadeIn(); }).catch(() => {
+      // 浏览器仍然拦截：让音乐按钮跳动提示，下一次点击时重试（iOS 上只有 click 算用户操作）
       musicStarted = false;
       musicBtn.classList.add("nudge");
-      const retry = () => { startMusic(); };
-      addEventListener("pointerdown", retry, { once: true });
+      addEventListener("click", startMusic, { once: true });
     });
   }
 
   musicBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     if (!musicStarted) return startMusic();
-    if (audio.paused) { audio.play(); setPlayingUI(true); }
+    if (audio.paused) { if (actx) actx.resume(); audio.play(); setPlayingUI(true); }
     else { audio.pause(); setPlayingUI(false); }
+  });
+
+  // 切到后台再回来时 iOS 会挂起 AudioContext
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && actx && !audio.paused) actx.resume();
   });
 
   // 微信内置浏览器：在 JSBridge 就绪时预加载
