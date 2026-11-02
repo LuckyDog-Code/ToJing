@@ -237,7 +237,7 @@
 
   /* 对着麦克风吹气 */
   const AC = window.AudioContext || window.webkitAudioContext;
-  let micStream, micCtx, micRaf, micBusy = false;
+  let micStream, micCtx, micRaf, micBusy = false, musicPausedForMic = false;
   function closeMicCtx() {
     if (micCtx) micCtx.close();
     micCtx = null;
@@ -250,7 +250,11 @@
     micBusy = false;
     $("mic-btn").classList.remove("listening");
     document.querySelectorAll(".flame").forEach((f) => { f.style.opacity = ""; });
-    if (musicStarted && audio.paused) audio.play().catch(() => {}); // iOS 开麦时可能打断背景音乐
+    // 等系统把音频切回播放模式再继续放歌，否则 iOS 会从听筒小声放、断断续续
+    if (musicPausedForMic) {
+      musicPausedForMic = false;
+      setTimeout(() => { audio.play().then(() => setPlayingUI(true)).catch(() => musicBtn.classList.add("nudge")); }, 600);
+    }
   }
 
   // iOS 上 AudioContext 必须在麦克风打开之后再建：开麦会改采样率，之前建的读到的全是 0。
@@ -276,12 +280,14 @@
 
   $("mic-btn").addEventListener("click", async () => {
     const btn = $("mic-btn");
-    if (micBusy) return;
+    if (micBusy) { if (micCtx) micCtx.resume(); return; } // 再点一下可以唤醒被挂起的音频
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !AC) {
       btn.textContent = "这里用不了麦克风，点一下蜡烛就好啦";
       return;
     }
     micBusy = true;
+    // iOS 开麦时会把正在放的歌切到听筒，麦克风也会被干扰；先暂停，吹完再接着放
+    if (!audio.paused) { audio.pause(); setPlayingUI(false); musicPausedForMic = true; }
     try {
       // 关掉降噪、回声消除和自动增益，否则吹气声会被当成噪音滤掉
       micStream = await navigator.mediaDevices.getUserMedia({
@@ -319,8 +325,17 @@
     let noise = 0, noiseN = 0, loud = 0, peak = 0;
 
     (function listen() {
-      const rms = level();
       const now = performance.now();
+      // Safari 可能让授权后才建的 AudioContext 处于挂起状态，读数全是 0；提示她再点一下
+      if (micCtx.state !== "running") {
+        btn.textContent = "再点我一下，然后对着手机吹～";
+        wayStart = t0 = now; noise = noiseN = 0;
+        if (now > deadline) { stopMic(); btn.textContent = C.micButton; return; }
+        micRaf = requestAnimationFrame(listen);
+        return;
+      }
+      if (btn.textContent.startsWith("再点我")) btn.textContent = "在听哦，对着手机用力吹～";
+      const rms = level();
       peak = Math.max(peak, rms);
       // 一秒多都是完全的 0：说明这种方式读不到麦克风，换下一种
       if (peak === 0 && now - wayStart > 1200) {
